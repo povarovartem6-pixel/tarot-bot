@@ -1,0 +1,1111 @@
+import asyncio
+import logging
+import sqlite3
+import random
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, PreCheckoutQuery
+)
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+import pytz
+
+from predictions_data import (
+    TAROT_CARDS, YES_NO_ANSWERS, DAILY_ADVICES, RELATIONSHIP_READINGS,
+    WEEKLY_FORECASTS, DREAM_SYMBOLS, UNIVERSAL_DREAM_READINGS, YEARLY_FORECASTS
+)
+
+# ============== КОНФИГУРАЦИЯ ==============
+BOT_TOKEN = "8949228095:AAGc9Pttt0lO0v9Jp60D0hkhaxTWpsEnbvQ"
+OWNER_ID = 8361478292
+
+FREE_PREDICTIONS_DAILY = 3
+PREDICTION_PRICE = 15
+MIN_TOP_UP = 50
+TOP_UP_STEP = 10
+BONUS_THRESHOLD = 500
+BONUS_PERCENT = 5
+DAILY_BONUS_AMOUNT = 15
+DAILY_BONUS_DAYS = 7
+TIMEZONE = "Europe/Moscow"
+
+# ============== БАЗА ДАННЫХ ==============
+class Database:
+    def __init__(self, db_path: str = "bot.db"):
+        self.db_path = db_path
+        self.timezone = pytz.timezone(TIMEZONE)
+        self.init_db()
+
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    balance INTEGER DEFAULT 0,
+                    free_today INTEGER DEFAULT 0,
+                    last_free_date TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    last_visit_date TEXT,
+                    consecutive_days INTEGER DEFAULT 0,
+                    total_predictions INTEGER DEFAULT 0,
+                    total_spent INTEGER DEFAULT 0,
+                    is_owner INTEGER DEFAULT 0
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    type TEXT,
+                    stars_spent INTEGER,
+                    date TEXT,
+                    result_preview TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount INTEGER,
+                    date TEXT,
+                    status TEXT,
+                    payment_id TEXT
+                )
+            ''')
+            conn.commit()
+
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def create_user(self, user_id: int, username: str = None, full_name: str = None) -> Dict[str, Any]:
+        now = datetime.now(self.timezone)
+        today = now.strftime("%Y-%m-%d")
+        is_owner = 1 if user_id == OWNER_ID else 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO users 
+                (user_id, username, full_name, balance, free_today, last_free_date, last_visit_date, is_owner)
+                VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+            ''', (user_id, username, full_name, FREE_PREDICTIONS_DAILY, today, today, is_owner))
+            conn.commit()
+        return self.get_user(user_id)
+
+    def is_owner(self, user_id: int) -> bool:
+        return user_id == OWNER_ID
+
+    def update_user_visit(self, user_id: int) -> None:
+        user = self.get_user(user_id)
+        if not user:
+            return
+        now = datetime.now(self.timezone)
+        today = now.strftime("%Y-%m-%d")
+        consecutive_days = user.get("consecutive_days", 0) or 0
+        last_visit = user.get("last_visit_date")
+
+        if last_visit:
+            last_date = datetime.strptime(last_visit, "%Y-%m-%d").date()
+            delta = (now.date() - last_date).days
+            if delta == 1:
+                consecutive_days += 1
+            elif delta > 1:
+                consecutive_days = 1
+            elif delta == 0:
+                consecutive_days = max(consecutive_days, 1)
+        else:
+            consecutive_days = 1
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users SET last_visit_date = ?, consecutive_days = ?
+                WHERE user_id = ?
+            ''', (today, consecutive_days, user_id))
+            conn.commit()
+
+        if consecutive_days == DAILY_BONUS_DAYS and not self.is_owner(user_id):
+            self.add_daily_bonus(user_id)
+
+    def add_daily_bonus(self, user_id: int) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE users SET balance = balance + ? WHERE user_id = ?',
+                (DAILY_BONUS_AMOUNT, user_id)
+            )
+            cursor.execute('''
+                INSERT INTO history (user_id, type, stars_spent, date, result_preview)
+                VALUES (?, 'daily_bonus', ?, datetime('now', 'localtime'), ?)
+            ''', (user_id, DAILY_BONUS_AMOUNT, f"Ежедневный бонус за {DAILY_BONUS_DAYS} дней"))
+            conn.commit()
+
+    def check_daily_reset(self, user_id: int) -> None:
+        if self.is_owner(user_id):
+            return
+        user = self.get_user(user_id)
+        if not user:
+            return
+        now = datetime.now(self.timezone)
+        today = now.strftime("%Y-%m-%d")
+        if user.get("last_free_date") != today:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE users SET free_today = ?, last_free_date = ?
+                    WHERE user_id = ?
+                ''', (FREE_PREDICTIONS_DAILY, today, user_id))
+                conn.commit()
+
+    def use_free_prediction(self, user_id: int) -> bool:
+        if self.is_owner(user_id):
+            return True
+        self.check_daily_reset(user_id)
+        user = self.get_user(user_id)
+        if user["free_today"] > 0:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'UPDATE users SET free_today = free_today - 1 WHERE user_id = ?',
+                    (user_id,)
+                )
+                conn.commit()
+            return True
+        return False
+
+    def spend_stars(self, user_id: int, amount: int) -> bool:
+        if self.is_owner(user_id):
+            return True
+        user = self.get_user(user_id)
+        if user["balance"] >= amount:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?',
+                    (amount, amount, user_id)
+                )
+                conn.commit()
+            return True
+        return False
+
+    def add_stars(self, user_id: int, amount: int) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE users SET balance = balance + ? WHERE user_id = ?',
+                (amount, user_id)
+            )
+            conn.commit()
+
+    def add_history(self, user_id: int, type_: str, stars_spent: int, preview: str) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO history (user_id, type, stars_spent, date, result_preview)
+                VALUES (?, ?, ?, datetime('now', 'localtime'), ?)
+            ''', (user_id, type_, stars_spent, preview))
+            conn.commit()
+
+    def increment_predictions(self, user_id: int) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE users SET total_predictions = total_predictions + 1 WHERE user_id = ?',
+                (user_id,)
+            )
+            conn.commit()
+
+    def get_history(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT * FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?',
+                (user_id, limit)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def add_payment(self, user_id: int, amount: int, payment_id: str, status: str = "completed") -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO payments (user_id, amount, date, status, payment_id)
+                VALUES (?, ?, datetime('now', 'localtime'), ?, ?)
+            ''', (user_id, amount, status, payment_id))
+            conn.commit()
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as total FROM users")
+            total_users = cursor.fetchone()["total"]
+
+            cursor.execute("SELECT COUNT(*) as today FROM users WHERE DATE(created_at) = DATE('now')")
+            new_today = cursor.fetchone()["today"]
+
+            cursor.execute("SELECT COUNT(*) as week FROM users WHERE created_at >= datetime('now', '-7 days')")
+            new_week = cursor.fetchone()["week"]
+
+            cursor.execute("SELECT COALESCE(SUM(amount), 0) as s FROM payments WHERE status='completed'")
+            total_stars = cursor.fetchone()["s"]
+
+            cursor.execute("SELECT COALESCE(SUM(amount), 0) as s FROM payments WHERE status='completed' AND DATE(date) = DATE('now')")
+            stars_today = cursor.fetchone()["s"]
+
+            cursor.execute("SELECT COUNT(*) as c FROM history WHERE type NOT IN ('top_up','daily_bonus','gift_received')")
+            total_predictions = cursor.fetchone()["c"]
+
+            cursor.execute("SELECT COUNT(*) as c FROM payments WHERE status='completed'")
+            payments_count = cursor.fetchone()["c"]
+
+            return {
+                "total_users": total_users,
+                "new_today": new_today,
+                "new_week": new_week,
+                "total_stars": total_stars,
+                "stars_today": stars_today,
+                "total_predictions": total_predictions,
+                "payments_count": payments_count,
+            }
+
+    def get_all_users(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users ORDER BY created_at DESC LIMIT ?', (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_recent_payments(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT p.*, u.username, u.full_name FROM payments p
+                LEFT JOIN users u ON u.user_id = p.user_id
+                ORDER BY p.id DESC LIMIT ?
+            ''', (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+# ============== FSM ==============
+class PredictionStates(StatesGroup):
+    waiting_for_dream = State()
+    waiting_for_custom_amount = State()
+
+# ============== КЛАВИАТУРЫ ==============
+def main_keyboard(is_owner: bool = False):
+    kb = [
+        [InlineKeyboardButton(text="🔮 Получить прогноз", callback_data="get_prediction")],
+        [InlineKeyboardButton(text="💰 Мой баланс", callback_data="my_balance")],
+        [InlineKeyboardButton(text="⭐ Пополнить баланс", callback_data="top_up")],
+        [InlineKeyboardButton(text="🎁 Подарить прогноз", callback_data="gift_prediction")],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="my_profile")],
+    ]
+    if is_owner:
+        kb.append([InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def prediction_types_keyboard():
+    predictions = [
+        ("🃏 Карта дня (Таро)", "tarot_day"),
+        ("✅ Ответ Да/Нет", "yes_no"),
+        ("💫 Совет дня", "daily_advice"),
+        ("💑 Расклад на отношения", "relationship"),
+        ("📅 Прогноз на неделю", "weekly"),
+        ("🌙 Расшифровка сна", "dream"),
+        ("🔮 Прогноз на год", "yearly"),
+    ]
+    keyboard = [[InlineKeyboardButton(text=t, callback_data=f"pred_{cb}")] for t, cb in predictions]
+    keyboard.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def top_up_keyboard():
+    amounts = [50, 100, 150, 500, 1000, 1500]
+    keyboard = []
+    row = []
+    for i, amount in enumerate(amounts):
+        row.append(InlineKeyboardButton(text=f"{amount}⭐", callback_data=f"topup_{amount}"))
+        if (i + 1) % 2 == 0:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton(text="💎 Другая сумма", callback_data="custom_amount")])
+    keyboard.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def after_prediction_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔮 Ещё прогноз", callback_data="get_prediction")],
+        [InlineKeyboardButton(text="⭐ Пополнить", callback_data="top_up")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+    ])
+
+def admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="💳 Платежи", callback_data="admin_payments")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+    ])
+
+# ============== ГЕНЕРАТОР ПРОГНОЗОВ ==============
+class PredictionGenerator:
+    @staticmethod
+    def tarot_day():
+        card, meaning = random.choice(TAROT_CARDS)
+        return f"<b>{card}</b>\n\n{meaning}"
+
+    @staticmethod
+    def yes_no():
+        return random.choice(YES_NO_ANSWERS)
+
+    @staticmethod
+    def daily_advice():
+        return random.choice(DAILY_ADVICES)
+
+    @staticmethod
+    def relationship():
+        emoji, meaning = random.choice(RELATIONSHIP_READINGS)
+        return f"{emoji} <b>Тройной расклад:</b>\n\n{meaning}"
+
+    @staticmethod
+    def weekly():
+        days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+        lines = ["📅 <b>Прогноз на неделю:</b>\n"]
+        for day in days:
+            lines.append(f"<b>{day}:</b> {random.choice(WEEKLY_FORECASTS[day])}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def yearly():
+        return "🔮 <b>Прогноз на год:</b>\n\n" + random.choice(YEARLY_FORECASTS)
+
+    @staticmethod
+    def dream_interpretation(dream_text: str):
+        text_lower = dream_text.lower()
+        found = []
+        for symbol, meaning in DREAM_SYMBOLS.items():
+            if symbol in text_lower:
+                found.append(meaning)
+                if len(found) >= 3:
+                    break
+
+        if found:
+            return "🌙 <b>Расшифровка сна:</b>\n\n" + "\n\n".join(found)
+        return "🌙 <b>Расшифровка сна:</b>\n\n" + random.choice(UNIVERSAL_DREAM_READINGS)
+
+# ============== ИНИЦИАЛИЗАЦИЯ ==============
+db = Database()
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+# ============== START ==============
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    full_name = message.from_user.full_name
+
+    user = db.get_user(user_id)
+    if not user:
+        user = db.create_user(user_id, username, full_name)
+        if user_id != OWNER_ID:
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    f"🆕 <b>Новый пользователь!</b>\n\n"
+                    f"👤 Имя: {full_name}\n"
+                    f"🔗 Username: @{username or 'нет'}\n"
+                    f"🆔 ID: <code>{user_id}</code>"
+                )
+            except Exception:
+                pass
+
+    db.update_user_visit(user_id)
+    db.check_daily_reset(user_id)
+    user = db.get_user(user_id)
+
+    is_owner = db.is_owner(user_id)
+    balance = user["balance"]
+    free_today = user["free_today"]
+    predictions_available = balance // PREDICTION_PRICE
+
+    text = f"🌟 <b>Привет, {message.from_user.first_name}!</b> 👋\n\n"
+    text += "Я — твой проводник в мир тайн и предсказаний 🔮\n"
+    text += "Открой завесу будущего и узнай, что готовит тебе судьба.\n\n"
+
+    if is_owner:
+        text += "👑 <b>Режим владельца</b> — все прогнозы бесплатны навсегда!\n\n"
+    else:
+        text += f"🔮 <b>Бесплатных прогнозов сегодня:</b> {free_today}/{FREE_PREDICTIONS_DAILY}\n"
+        text += f"💰 <b>Твой баланс:</b> {balance}⭐\n"
+        text += f"📊 Хватит ещё на <b>{predictions_available}</b> прогнозов\n\n"
+        if balance < 30:
+            text += "⚠️ <i>У тебя осталось мало звёзд — пора пополнить!</i>\n\n"
+
+    text += "✨ Что хочешь узнать?"
+
+    await message.answer(text, reply_markup=main_keyboard(is_owner))
+
+# ============== ГЛАВНОЕ МЕНЮ ==============
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    db.check_daily_reset(user_id)
+    user = db.get_user(user_id)
+    is_owner = db.is_owner(user_id)
+
+    if is_owner:
+        text = "👑 <b>Режим владельца</b>\n\nВсе прогнозы бесплатны!\n\nЧто хочешь узнать?"
+    else:
+        text = f"🔮 Бесплатных прогнозов: <b>{user['free_today']}</b>\n"
+        text += f"💰 Баланс: <b>{user['balance']}⭐</b>\n\n"
+        text += "Что хочешь узнать?"
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=main_keyboard(is_owner))
+
+# ============== ПРОГНОЗЫ ==============
+@router.callback_query(F.data == "get_prediction")
+async def show_prediction_types(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    is_owner = db.is_owner(user_id)
+
+    if is_owner:
+        header = "👑 <b>Режим владельца — все прогнозы бесплатны</b>\n\n🔮 Выбери тип гадания:"
+    else:
+        user = db.get_user(user_id)
+        header = (
+            f"🔮 <b>Выбери тип гадания:</b>\n\n"
+            f"Бесплатных сегодня: <b>{user['free_today']}</b>\n"
+            f"Платный прогноз: <b>{PREDICTION_PRICE}⭐</b>"
+        )
+
+    await callback.message.edit_text(header, reply_markup=prediction_types_keyboard())
+
+@router.callback_query(F.data.startswith("pred_"))
+async def handle_prediction(callback: CallbackQuery, state: FSMContext):
+    prediction_type = callback.data.replace("pred_", "")
+    user_id = callback.from_user.id
+
+    db.check_daily_reset(user_id)
+    user = db.get_user(user_id)
+    is_owner = db.is_owner(user_id)
+
+    if prediction_type == "dream":
+        if not is_owner and user["free_today"] == 0 and user["balance"] < PREDICTION_PRICE:
+            await callback.answer("Недостаточно звёзд!", show_alert=True)
+            await callback.message.edit_text(
+                f"❌ <b>Недостаточно звёзд!</b>\n"
+                f"Нужно {PREDICTION_PRICE}⭐, у тебя {user['balance']}⭐\n\n"
+                "Пополни баланс:",
+                reply_markup=top_up_keyboard()
+            )
+            return
+        await state.set_state(PredictionStates.waiting_for_dream)
+        await callback.message.edit_text(
+            "🌙 <b>Расскажи свой сон</b>\n\n"
+            "Опиши его подробно — я найду символы и расшифрую послание.\n\n"
+            "<i>Например: «Мне снилось море, я плыл на корабле...»</i>"
+        )
+        await callback.answer()
+        return
+
+    if is_owner:
+        await process_prediction(callback, prediction_type, user_id, free=True, owner=True)
+        return
+
+    if user["free_today"] > 0:
+        if db.use_free_prediction(user_id):
+            await process_prediction(callback, prediction_type, user_id, free=True)
+            return
+
+    if user["balance"] >= PREDICTION_PRICE:
+        await process_prediction(callback, prediction_type, user_id, free=False)
+    else:
+        await callback.answer("Недостаточно звёзд!", show_alert=True)
+        await callback.message.edit_text(
+            f"❌ <b>Недостаточно звёзд для прогноза!</b>\n"
+            f"Нужно {PREDICTION_PRICE}⭐, а у тебя {user['balance']}⭐\n\n"
+            "Пополни баланс:",
+            reply_markup=top_up_keyboard()
+        )
+
+async def process_prediction(callback: CallbackQuery, prediction_type: str, user_id: int,
+                              free: bool, owner: bool = False):
+    gen = PredictionGenerator()
+
+    if prediction_type == "tarot_day":
+        result = gen.tarot_day()
+        preview = "Карта дня"
+    elif prediction_type == "yes_no":
+        result = gen.yes_no()
+        preview = "Ответ Да/Нет"
+    elif prediction_type == "daily_advice":
+        result = gen.daily_advice()
+        preview = "Совет дня"
+    elif prediction_type == "relationship":
+        result = gen.relationship()
+        preview = "Расклад на отношения"
+    elif prediction_type == "weekly":
+        result = gen.weekly()
+        preview = "Прогноз на неделю"
+    elif prediction_type == "yearly":
+        result = gen.yearly()
+        preview = "Прогноз на год"
+    else:
+        result = "Неизвестный тип прогноза"
+        preview = "Неизвестно"
+
+    db.increment_predictions(user_id)
+
+    if owner:
+        db.add_history(user_id, f"owner_{prediction_type}", 0, preview)
+        text = f"🔮 {result}\n\n👑 <i>Режим владельца — бесплатно</i>"
+    elif free:
+        db.add_history(user_id, f"free_{prediction_type}", 0, preview)
+        user = db.get_user(user_id)
+        text = f"🔮 {result}\n\n"
+        text += f"✅ <b>Бесплатный прогноз использован</b>\n"
+        text += f"Осталось бесплатных: <b>{user['free_today']}</b>\n"
+        text += f"💰 Баланс: <b>{user['balance']}⭐</b>"
+    else:
+        db.spend_stars(user_id, PREDICTION_PRICE)
+        db.add_history(user_id, prediction_type, PREDICTION_PRICE, preview)
+        user = db.get_user(user_id)
+        text = f"🔮 {result}\n\n"
+        text += f"⭐ Списано: <b>{PREDICTION_PRICE}⭐</b>\n"
+        text += f"💰 Остаток: <b>{user['balance']}⭐</b> "
+        text += f"(ещё на {user['balance'] // PREDICTION_PRICE} прогнозов)\n\n"
+        if user["balance"] < 30:
+            text += "⚠️ <i>У тебя осталось мало звёзд — пора пополнить!</i>\n\n"
+        text += "Хочешь ещё?"
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=after_prediction_keyboard())
+
+# Обработка текста сна
+@router.message(PredictionStates.waiting_for_dream)
+async def handle_dream(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    dream_text = message.text or ""
+    if len(dream_text) < 3:
+        await message.answer("🌙 Опиши сон подробнее, пожалуйста.")
+        return
+
+    db.check_daily_reset(user_id)
+    user = db.get_user(user_id)
+    is_owner = db.is_owner(user_id)
+
+    result = PredictionGenerator.dream_interpretation(dream_text)
+    db.increment_predictions(user_id)
+
+    if is_owner:
+        db.add_history(user_id, "owner_dream", 0, "Расшифровка сна")
+        text = f"{result}\n\n👑 <i>Режим владельца — бесплатно</i>"
+    elif user["free_today"] > 0:
+        db.use_free_prediction(user_id)
+        db.add_history(user_id, "free_dream", 0, "Расшифровка сна")
+        user = db.get_user(user_id)
+        text = f"{result}\n\n"
+        text += f"✅ <b>Бесплатный прогноз использован</b>\n"
+        text += f"Осталось бесплатных: <b>{user['free_today']}</b>\n"
+        text += f"💰 Баланс: <b>{user['balance']}⭐</b>"
+    elif user["balance"] >= PREDICTION_PRICE:
+        db.spend_stars(user_id, PREDICTION_PRICE)
+        db.add_history(user_id, "dream", PREDICTION_PRICE, "Расшифровка сна")
+        user = db.get_user(user_id)
+        text = f"{result}\n\n"
+        text += f"⭐ Списано: <b>{PREDICTION_PRICE}⭐</b>\n"
+        text += f"💰 Остаток: <b>{user['balance']}⭐</b>\n\n"
+        if user["balance"] < 30:
+            text += "⚠️ <i>Пора пополнить баланс!</i>\n\n"
+        text += "Хочешь ещё?"
+    else:
+        await state.clear()
+        await message.answer(
+            f"❌ <b>Недостаточно звёзд!</b>\n"
+            f"Нужно {PREDICTION_PRICE}⭐, у тебя {user['balance']}⭐",
+            reply_markup=top_up_keyboard()
+        )
+        return
+
+    await state.clear()
+    await message.answer(text, reply_markup=after_prediction_keyboard())
+
+# ============== БАЛАНС ==============
+@router.callback_query(F.data == "my_balance")
+async def show_balance(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    history = db.get_history(user_id, 8)
+    is_owner = db.is_owner(user_id)
+
+    if is_owner:
+        text = "👑 <b>Твой баланс</b>\n\n"
+        text += "💫 <b>Бесплатно навсегда</b> (режим владельца)\n\n"
+    else:
+        balance = user["balance"]
+        free_today = user["free_today"]
+        text = f"💰 <b>Баланс:</b> {balance}⭐\n"
+        text += f"🔮 <b>Бесплатных прогнозов сегодня:</b> {free_today}\n"
+        text += f"📊 Хватит на <b>{balance // PREDICTION_PRICE}</b> прогнозов\n\n"
+
+    if history:
+        text += "📜 <b>Последние операции:</b>\n"
+        for item in history:
+            spent = item["stars_spent"]
+            if item["type"] in ("top_up", "daily_bonus", "gift_received"):
+                emoji = "➕"
+            elif item["type"].startswith(("owner_", "free_")):
+                emoji = "🆓"
+            else:
+                emoji = "➖"
+            preview = item["result_preview"][:30]
+            text += f"{emoji} {preview}: {abs(spent)}⭐\n"
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=main_keyboard(is_owner))
+
+# ============== ПРОФИЛЬ ==============
+@router.callback_query(F.data == "my_profile")
+async def show_profile(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    is_owner = db.is_owner(user_id)
+
+    name = user.get("full_name") or callback.from_user.full_name
+    username = f"@{user['username']}" if user.get("username") else "нет"
+
+    text = (
+        f"👤 <b>Твой профиль</b>\n\n"
+        f"📝 Имя: {name}\n"
+        f"🔗 Username: {username}\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
+    )
+
+    if is_owner:
+        text += "👑 <b>Статус:</b> Владелец\n"
+        text += "💫 <b>Прогнозы:</b> Бесплатно навсегда\n"
+    else:
+        text += f"💰 Баланс: <b>{user['balance']}⭐</b>\n"
+        text += f"🔮 Всего прогнозов: <b>{user['total_predictions']}</b>\n"
+        text += f"⭐ Всего потрачено: <b>{user['total_spent']}⭐</b>\n"
+        text += f"📅 Дней подряд: <b>{user['consecutive_days']}</b>\n"
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=main_keyboard(is_owner))
+
+# ============== ПОПОЛНЕНИЕ ==============
+@router.callback_query(F.data == "top_up")
+async def show_top_up(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+
+    if db.is_owner(callback.from_user.id):
+        await callback.message.edit_text(
+            "👑 Владельцу пополнение не требуется — у тебя безлимит!",
+            reply_markup=main_keyboard(True)
+        )
+        return
+
+    await callback.message.edit_text(
+        "⭐ <b>Выбери сумму пополнения:</b>\n\n"
+        f"💎 При пополнении от <b>{BONUS_THRESHOLD}⭐</b> — бонус <b>+{BONUS_PERCENT}%</b>!\n"
+        f"💫 1 прогноз = {PREDICTION_PRICE}⭐",
+        reply_markup=top_up_keyboard()
+    )
+
+@router.callback_query(F.data == "custom_amount")
+async def custom_amount(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PredictionStates.waiting_for_custom_amount)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"💎 <b>Введи сумму</b>\n\n"
+        f"Минимум: {MIN_TOP_UP}⭐\n"
+        f"Кратно: {TOP_UP_STEP}⭐\n\n"
+        f"<i>Напиши число одним сообщением</i>"
+    )
+
+@router.message(PredictionStates.waiting_for_custom_amount)
+async def process_custom_amount(message: Message, state: FSMContext):
+    try:
+        amount = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Введи корректное число!")
+        return
+
+    if amount < MIN_TOP_UP:
+        await message.answer(f"❌ Минимальная сумма: {MIN_TOP_UP}⭐")
+        return
+    if amount % TOP_UP_STEP != 0:
+        await message.answer(f"❌ Сумма должна быть кратна {TOP_UP_STEP}⭐")
+        return
+
+    await state.clear()
+    await show_payment_confirm(message, amount)
+
+@router.callback_query(F.data.startswith("topup_"))
+async def process_top_up(callback: CallbackQuery):
+    try:
+        amount = int(callback.data.replace("topup_", ""))
+    except ValueError:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    await callback.answer()
+    await show_payment_confirm(callback.message, amount, edit=True)
+
+async def show_payment_confirm(message: Message, amount: int, edit: bool = False):
+    if amount >= BONUS_THRESHOLD:
+        bonus = int(amount * BONUS_PERCENT / 100)
+        total = amount + bonus
+        text = (
+            f"💎 <b>Сумма:</b> {amount}⭐\n"
+            f"🎁 <b>Бонус:</b> +{bonus}⭐ ({BONUS_PERCENT}%)\n"
+            f"💰 <b>Будет начислено:</b> {total}⭐\n\n"
+            "Нажми кнопку ниже для оплаты:"
+        )
+    else:
+        total = amount
+        text = f"💰 <b>Сумма пополнения:</b> {amount}⭐\n\nНажми кнопку ниже для оплаты:"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {amount}⭐", callback_data=f"pay_{amount}_{total}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="top_up")]
+    ])
+
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+# ============== ОПЛАТА TELEGRAM STARS ==============
+@router.callback_query(F.data.startswith("pay_"))
+async def create_invoice(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    amount = int(parts[1])
+    total_amount = int(parts[2])
+
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="⭐ Пополнение баланса",
+        description=f"Пополнение на {total_amount}⭐",
+        payload=f"topup_{total_amount}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Пополнение", amount=amount)]
+    )
+    await callback.answer()
+
+@router.pre_checkout_query()
+async def pre_checkout(pre_checkout: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message):
+    payment_info = message.successful_payment
+    payload = payment_info.invoice_payload
+    total_amount = int(payload.replace("topup_", ""))
+
+    user_id = message.from_user.id
+    db.add_stars(user_id, total_amount)
+    db.add_payment(user_id, total_amount, payment_info.telegram_payment_charge_id, "completed")
+    db.add_history(user_id, "top_up", total_amount, "Пополнение баланса")
+
+    user = db.get_user(user_id)
+
+    try:
+        await bot.send_message(
+            OWNER_ID,
+            f"💰 <b>Новое пополнение!</b>\n\n"
+            f"👤 {user.get('full_name') or 'Пользователь'}\n"
+            f"🔗 @{user.get('username') or 'нет'}\n"
+            f"🆔 <code>{user_id}</code>\n"
+            f"💵 Сумма: <b>{total_amount}⭐</b>\n"
+            f"📊 Баланс: {user['balance']}⭐"
+        )
+    except Exception:
+        pass
+
+    text = (
+        f"✅ <b>Платёж успешен!</b>\n\n"
+        f"💰 Баланс пополнен на <b>{total_amount}⭐</b>\n"
+        f"💎 Текущий баланс: <b>{user['balance']}⭐</b>\n"
+        f"🔮 Хватит на <b>{user['balance'] // PREDICTION_PRICE}</b> прогнозов\n\n"
+        "Что хочешь сделать дальше?"
+    )
+
+    await message.answer(text, reply_markup=main_keyboard())
+
+# ============== ПОДАРОК ==============
+@router.callback_query(F.data == "gift_prediction")
+async def gift_prediction_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+
+    if db.is_owner(user_id) or user["balance"] >= PREDICTION_PRICE:
+        text = (
+            "🎁 <b>Подарить прогноз другу</b>\n\n"
+            f"Стоимость: <b>{PREDICTION_PRICE}⭐</b>\n\n"
+            "Отправь команду:\n"
+            "<code>/gift USER_ID</code>\n\n"
+            "<i>Например: /gift 123456789</i>\n\n"
+            "💡 Узнать ID друга можно через @userinfobot"
+        )
+    else:
+        text = (
+            "🎁 <b>Подарить прогноз другу</b>\n\n"
+            f"Стоимость: <b>{PREDICTION_PRICE}⭐</b>\n\n"
+            f"❌ У тебя недостаточно звёзд: {user['balance']}⭐\n\n"
+            "Пополни баланс, чтобы делать подарки!"
+        )
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=main_keyboard(db.is_owner(user_id)))
+
+@router.message(Command("gift"))
+async def gift_prediction(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("❌ Укажи ID: <code>/gift USER_ID</code>")
+        return
+
+    try:
+        friend_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ Неверный формат ID")
+        return
+
+    user_id = message.from_user.id
+    if friend_id == user_id:
+        await message.answer("❌ Нельзя подарить самому себе!")
+        return
+
+    user = db.get_user(user_id)
+    is_owner = db.is_owner(user_id)
+
+    if not is_owner and user["balance"] < PREDICTION_PRICE:
+        await message.answer(
+            f"❌ Недостаточно звёзд! Нужно {PREDICTION_PRICE}⭐, у тебя {user['balance']}⭐",
+            reply_markup=top_up_keyboard()
+        )
+        return
+
+    friend = db.get_user(friend_id)
+    if not friend:
+        friend = db.create_user(friend_id, f"friend_{friend_id}", "Друг")
+
+    if not is_owner:
+        db.spend_stars(user_id, PREDICTION_PRICE)
+        db.add_history(user_id, "gift_sent", PREDICTION_PRICE, f"Подарок {friend_id}")
+
+    db.add_stars(friend_id, PREDICTION_PRICE)
+    db.add_history(friend_id, "gift_received", PREDICTION_PRICE, f"Подарок от {user_id}")
+
+    try:
+        await bot.send_message(
+            friend_id,
+            f"🎁 <b>Тебе подарили прогноз!</b>\n\n"
+            f"⭐ +{PREDICTION_PRICE}⭐ зачислено на баланс\n"
+            f"💰 Текущий баланс: <b>{db.get_user(friend_id)['balance']}⭐</b>\n\n"
+            "Скорее получи свой прогноз! 🔮"
+        )
+    except Exception:
+        pass
+
+    user_after = db.get_user(user_id)
+    if is_owner:
+        await message.answer(
+            f"✅ <b>Подарок отправлен!</b>\n\n"
+            f"👑 <i>Режим владельца — без списания</i>\n"
+            f"🎁 Друг получил {PREDICTION_PRICE}⭐",
+            reply_markup=main_keyboard(True)
+        )
+    else:
+        await message.answer(
+            f"✅ <b>Подарок отправлен!</b>\n\n"
+            f"⭐ Списано: {PREDICTION_PRICE}⭐\n"
+            f"💰 Остаток: {user_after['balance']}⭐",
+            reply_markup=main_keyboard()
+        )
+
+# ============== АДМИН-ПАНЕЛЬ ==============
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
+    if not db.is_owner(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        "👑 <b>Админ-панель</b>\n\nВыбери раздел:",
+        reply_markup=admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if not db.is_owner(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    s = db.get_stats()
+    text = (
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 <b>Пользователи:</b>\n"
+        f"   • Всего: <b>{s['total_users']}</b>\n"
+        f"   • Сегодня: <b>+{s['new_today']}</b>\n"
+        f"   • За неделю: <b>+{s['new_week']}</b>\n\n"
+        f"💰 <b>Платежи:</b>\n"
+        f"   • Всего: <b>{s['total_stars']}⭐</b>\n"
+        f"   • Сегодня: <b>{s['stars_today']}⭐</b>\n"
+        f"   • Транзакций: <b>{s['payments_count']}</b>\n\n"
+        f"🔮 <b>Прогнозов выдано:</b> <b>{s['total_predictions']}</b>"
+    )
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=admin_keyboard())
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not db.is_owner(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    users = db.get_all_users(30)
+    text = "👥 <b>Последние пользователи:</b>\n\n"
+
+    for u in users:
+        username = f"@{u['username']}" if u.get('username') else "—"
+        name = (u.get("full_name") or "—")[:20]
+        is_owner_mark = " 👑" if u["user_id"] == OWNER_ID else ""
+        text += (
+            f"<b>{name}</b>{is_owner_mark}\n"
+            f"  ID: <code>{u['user_id']}</code>\n"
+            f"  {username} | 💰 {u['balance']}⭐ | 🔮 {u['total_predictions']}\n\n"
+        )
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=admin_keyboard())
+
+@router.callback_query(F.data == "admin_payments")
+async def admin_payments(callback: CallbackQuery):
+    if not db.is_owner(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    payments = db.get_recent_payments(20)
+    if not payments:
+        text = "💳 <b>Платежей пока нет</b>"
+    else:
+        text = "💳 <b>Последние платежи:</b>\n\n"
+        for p in payments:
+            username = f"@{p['username']}" if p.get('username') else "—"
+            text += (
+                f"💰 <b>{p['amount']}⭐</b> — {username}\n"
+                f"  ID: <code>{p['user_id']}</code>\n"
+                f"  📅 {p['date']}\n"
+                f"  ✅ {p['status']}\n\n"
+            )
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=admin_keyboard())
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast(callback: CallbackQuery):
+    if not db.is_owner(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        "📢 <b>Рассылка</b>\n\n"
+        "Отправь команду:\n"
+        "<code>/broadcast Текст сообщения</code>\n\n"
+        "<i>Сообщение получат все пользователи бота.</i>",
+        reply_markup=admin_keyboard()
+    )
+
+@router.message(Command("broadcast"))
+async def broadcast(message: Message):
+    if not db.is_owner(message.from_user.id):
+        return
+
+    text = message.text.replace("/broadcast", "").strip()
+    if not text:
+        await message.answer("❌ Использование: <code>/broadcast Текст</code>")
+        return
+
+    users = db.get_all_users(10000)
+    sent = 0
+    failed = 0
+
+    status_msg = await message.answer(f"📢 Отправка... 0/{len(users)}")
+
+    for u in users:
+        if u["user_id"] == OWNER_ID:
+            continue
+        try:
+            await bot.send_message(u["user_id"], f"📢 <b>Сообщение от бота:</b>\n\n{text}")
+            sent += 1
+        except Exception:
+            failed += 1
+
+        if sent % 10 == 0:
+            try:
+                await status_msg.edit_text(f"📢 Отправка... {sent + failed}/{len(users)}")
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.05)
+
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📤 Отправлено: <b>{sent}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>"
+    )
+
+# ============== FALLBACK ==============
+@router.message()
+async def fallback(message: Message):
+    user_id = message.from_user.id
+    is_owner = db.is_owner(user_id)
+    await message.answer(
+        "🤔 Не понял команду.\n\n"
+        "Используй кнопки ниже или /start",
+        reply_markup=main_keyboard(is_owner)
+    )
+
+# ============== ЗАПУСК ==============
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s"
+    )
+    print("✨ Бот запущен и готов к работе!")
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
